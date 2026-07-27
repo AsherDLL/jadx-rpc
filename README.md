@@ -1,6 +1,21 @@
 # jadx-rpc
 
-Headless [jadx](https://github.com/skylot/jadx) sessions for LLM agents.
+A headless [jadx](https://github.com/skylot/jadx) engine for LLM agents. It
+answers structured questions about an APK, DEX or JAR over a plain command line,
+one JSON object per call.
+
+    $ jadx-rpc callers 'com.example.Payments.sign'
+    $ jadx-rpc members com.example.Payments
+    $ jadx-rpc class com.example.Payments --lines 40:120
+
+**Despite the name, there is no RPC in it.** No daemon, no socket, no port,
+nothing running between calls. The name follows
+[ghidra-rpc](https://github.com/cellebrite-labs/ghidra-rpc), which established
+`<tool>-rpc` as the headless component that lets an agent drive a decompiler.
+Ghidra needs a live process because its analysis exists only inside a JVM. jadx
+writes plain files, so this one does not, and a session is just a directory.
+
+## Why it exists
 
 jadx has two shapes today and neither suits an autonomous agent. The GUI is
 built for a human reading code on a screen, and the plugins that expose it to a
@@ -8,17 +23,19 @@ model need that GUI running. The command line tool is a batch decompiler with no
 memory between runs, so an agent that asks twenty questions pays the full
 parsing cost twenty times.
 
-jadx-rpc adds the missing piece, a session. Opening a target does the expensive
-work once and writes it to disk. Everything after that is a file read, a regex
-scan or a single class decompile, and it answers in milliseconds. It drives the
-real jadx command line, so it works anywhere jadx works and never needs a
-display.
+More to the point, jadx can already emit the two things that make Java analysis
+more than text search, and neither is usable as it stands: the symbol index
+arrives as a 35 MB single-line JSON file, and the call graph as a list of node
+and edge ids. No model can read either. Something has to query them. That is
+what this is.
+
+If you only need to read and grep decompiled source, you do not need this at
+all. Run `jadx -d out app.apk` and use your normal tools. See
+[docs/INTEGRATION.md](docs/INTEGRATION.md) for where that line falls.
 
 ## How it works
 
-There is no daemon and no socket. Ghidra needs one because its analysis only
-exists inside a live JVM and dies with it. jadx does not have that constraint,
-its output is plain files, so the session is a directory:
+The session is a directory:
 
     ~/.local/state/jadx-rpc/<hash>/
       session.json      what was opened and how
