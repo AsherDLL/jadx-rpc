@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -9,11 +11,13 @@ from pathlib import Path
 import pytest
 
 import jadx_rpc
+from jadx_rpc import core
 from jadx_rpc.core import JadxRpcError
 
-from .conftest import needs_jadx, needs_javac, run_cli
+from .conftest import needs_jadx, needs_javac, plant_manifest, run_cli
 
 REPO = Path(__file__).parent.parent
+VENDOR = "net.thirdparty.lib.Helper"
 
 pytestmark = [needs_jadx, needs_javac]
 
@@ -46,6 +50,103 @@ def test_classes_filters(opened):
     filtered = jadx_rpc.classes("hex")
     assert [c["name"] for c in filtered["classes"]] == ["com.example.app.util.Hex"]
     assert filtered["matched"] == 1
+
+
+class TestScope:
+    """Scoping hides bundled library code, and always says how much."""
+
+    def test_without_a_manifest_nothing_is_scoped_away(self, opened):
+        result = jadx_rpc.classes()
+        assert result["scope"] == "all", "a jar has no manifest to scope against"
+        assert "no AndroidManifest.xml" in result["scope_note"]
+        assert "hidden_by_scope" not in result
+        assert VENDOR in {c["name"] for c in result["classes"]}
+
+    def test_classes_hides_another_vendor_and_reports_it(self, opened):
+        plant_manifest()
+        result = jadx_rpc.classes()
+        names = {c["name"] for c in result["classes"]}
+        assert VENDOR not in names
+        assert "com.example.app.Crypto" in names
+        assert result["app_package_prefix"] == "com.example"
+        assert result["hidden_by_scope"] == 1
+        assert result["matched_all_scopes"] == result["matched"] + 1
+        assert "--scope all" in result["scope_note"]
+
+    def test_scope_all_puts_it_back(self, opened):
+        plant_manifest()
+        result = jadx_rpc.classes(scope="all")
+        assert VENDOR in {c["name"] for c in result["classes"]}
+        assert "hidden_by_scope" not in result
+
+    def test_a_prefix_must_end_on_a_package_boundary(self, opened):
+        # com.exampleX is a different vendor from com.example and must not match.
+        plant_manifest("com.exam.app")
+        assert jadx_rpc.classes()["matched"] == 0
+        assert jadx_rpc.classes()["hidden_by_scope"] == 5
+
+    def test_symbols_scope_covers_members_of_a_hidden_class(self, opened):
+        plant_manifest()
+        result = jadx_rpc.symbols("describe")
+        assert result["matched"] == 0, "a method of a hidden class is hidden with it"
+        assert result["hidden_by_scope"] == 1
+        assert jadx_rpc.symbols("describe", scope="all")["matched"] == 1
+
+    def test_unknown_scope_is_rejected(self, opened):
+        with pytest.raises(JadxRpcError, match="unknown scope"):
+            jadx_rpc.classes(scope="everything")
+
+
+class TestJadxVersion:
+    """One engine has to work against whichever jadx a consumer pinned."""
+
+    def test_the_version_is_read_and_recorded(self, state, fixture_jar):
+        result = jadx_rpc.open_target(str(fixture_jar))
+        assert re.match(r"\d+\.\d+\.\d+", result["jadx_version"]), result["jadx_version"]
+        assert jadx_rpc.status()["jadx_version"] == result["jadx_version"]
+
+    def test_partial_decompiles_are_accepted_on_either_jadx(self):
+        # 1 up to jadx 1.5.1, 3 from 1.5.6, both meaning "finished with errors".
+        assert 1 in core.JADX_OK and 3 in core.JADX_OK
+
+    @pytest.mark.parametrize(
+        ("version", "supported"),
+        [("1.5.6", True), ("1.5.7", True), ("1.6.0", True), ("2.0.0", True),
+         ("1.5.1", False), ("1.4.9", False), ("unknown", False), ("", False)],
+    )
+    def test_callgraph_support_is_decided_by_version(self, version, supported):
+        assert core._supports_callgraph({"jadx_version": version}) is supported
+
+    def test_an_old_jadx_names_the_version_callers_needs(self, opened):
+        session = core.resolve(None)
+        meta = session.read_meta()
+        meta["jadx_version"] = "1.5.1"
+        session.write_meta(meta)
+        session.callgraph_path.unlink(missing_ok=True)
+        with pytest.raises(JadxRpcError, match="need jadx 1.5.6 or newer"):
+            jadx_rpc.callers("com.example.app.Crypto.encode")
+
+    def test_a_pass_that_produced_nothing_fails_even_on_an_accepted_exit_code(self, opened):
+        session = core.resolve(None)
+        with pytest.raises(JadxRpcError, match="produced no"):
+            core._run(session, "probe", ["true"], produces=session.dir / "never-written")
+
+
+class TestIndexDiskGuard:
+    def test_it_passes_when_there_is_room(self, tmp_path):
+        core._check_index_space(tmp_path, 1024)  # 25 KB needed, no exception
+
+    def test_it_refuses_and_names_the_numbers(self, tmp_path):
+        huge = shutil.disk_usage(tmp_path).free  # 25x free space cannot fit
+        with pytest.raises(JadxRpcError, match="not enough space"):
+            core._check_index_space(tmp_path, huge)
+
+    def test_index_tmp_redirects_the_scratch_directory(self, tmp_path):
+        session = core.Session(tmp_path / "session")
+        assert core._index_tmp(session, {}) == session.dir / "_index"
+        redirected = core._index_tmp(session, {"index_tmp": str(tmp_path / "big")})
+        assert redirected.parent == tmp_path / "big"
+        assert session.dir.name in redirected.name, "sessions must not collide in a shared dir"
 
 
 def test_classes_reports_truncation(opened):
@@ -162,6 +263,33 @@ class TestAfterExport:
         callees = {c["method"] for c in result["callees"]}
         assert any("Hex.toHex" in c for c in callees)
         assert any("Crypto.mix" in c for c in callees)
+
+    def test_search_scope_hides_another_vendor_and_reports_it(self):
+        plant_manifest()
+        scoped = jadx_rpc.search("thirdparty-vendor-banner")
+        assert scoped["matched"] == 0
+        assert scoped["hidden_by_scope"] >= 1
+        assert scoped["files_matched"] == 0
+
+        everything = jadx_rpc.search("thirdparty-vendor-banner", scope="all")
+        assert everything["matched"] >= 1
+        assert everything["hits"][0]["file"].startswith("net/thirdparty/")
+
+    def test_search_still_finds_app_code_while_scoped(self):
+        plant_manifest()
+        result = jadx_rpc.search("hunter2")
+        assert result["matched"] >= 1
+        assert result["hits"][0]["file"].startswith("com/example/")
+        assert result["app_package_prefix"] == "com.example"
+
+    def test_strings_scope_hides_another_vendor(self):
+        plant_manifest()
+        assert "thirdparty-vendor-banner" not in {
+            s["value"] for s in jadx_rpc.strings()["strings"]
+        }
+        assert "thirdparty-vendor-banner" in {
+            s["value"] for s in jadx_rpc.strings(scope="all")["strings"]
+        }
 
     def test_callers_rejects_an_unknown_method(self):
         with pytest.raises(JadxRpcError, match="no method in the call graph"):

@@ -39,6 +39,9 @@ in the background while you work.
 
    Searches class, method and field names in the index. Needs no export, so it
    works within a second of opening the target. Use this before `search`.
+   Scoped to the app's own package by default; read `hidden_by_scope` before
+   deciding whether the answer is "the app does not do this" or "I need to look
+   at the libraries too".
 
 4. `jadx-rpc members <class>`
 
@@ -85,17 +88,34 @@ fails and lists the candidates.
 
 ### Code
 
-    jadx-rpc classes [pattern] [--limit N]
+    jadx-rpc classes [pattern] [--scope app|all] [--limit N]
     jadx-rpc members <class>
     jadx-rpc class <class> [--lines A:B]
-    jadx-rpc symbols <pattern> [--kind class|method|field] [--limit N]
-    jadx-rpc search <pattern> [--limit N] [--context N]
-    jadx-rpc strings [pattern] [--min-len N] [--limit N]
+    jadx-rpc symbols <pattern> [--kind class|method|field] [--scope app|all] [--limit N]
+    jadx-rpc search <pattern> [--scope app|all] [--limit N] [--context N]
+    jadx-rpc strings [pattern] [--scope app|all] [--min-len N] [--limit N]
 
 `classes` and `symbols` read the index and need no export. `search` and
 `strings` read the decompiled sources and require it. Patterns are Python
 regular expressions, case insensitive for `classes` and `symbols`, case
 sensitive for `search` and `strings`.
+
+**Scope, and why it defaults to the app.** 93 percent of the classes in a real
+APK are bundled libraries. On one measured sample `symbols 'crypt|token|secret'`
+returns 2030 hits and not one of them is in the application's own code. So these
+four commands default to `--scope app`, meaning the package declared in the
+manifest.
+
+Nothing is hidden without being counted. A scoped result carries
+`matched_all_scopes` and `hidden_by_scope`, so you always know what you did not
+see and can widen with `--scope all`. Two cases worth recognising:
+
+- `matched: 0` with a large `hidden_by_scope` is a real answer. It means the
+  behaviour you searched for is in a bundled library and not in the app's own
+  code. Report that, do not immediately rerun with `--scope all` and report the
+  library hits as if they were the app's.
+- `scope: all` with a `scope_note` means there was no manifest to scope against,
+  which is every JAR and bare DEX. Nothing was filtered.
 
 Results that hit their limit report `"truncated": true` along with `matched`,
 the number of results that existed. Never read a truncated result as a complete
@@ -119,8 +139,12 @@ check `target_sdk` before relying on the derived value.
     jadx-rpc callers <method>
     jadx-rpc callees <method>
 
-Both require the export. The `resolved` field on each edge is jadx's own
-confidence that the call target was determined statically.
+Both require the export, and both require jadx 1.5.6 or newer. On an older jadx
+they fail saying so, and every other command still works. `jadx-rpc status`
+reports `jadx_version` and `callgraph_supported` if you want to check first.
+
+The `resolved` field on each edge is jadx's own confidence that the call target
+was determined statically.
 
 ### Renames
 

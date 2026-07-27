@@ -18,6 +18,7 @@ public class Main {
 
     static Result run(Crypto crypto, String payload) {
         String encoded = crypto.encode(payload);
+        net.thirdparty.lib.Helper.describe(encoded);
         return new Result(crypto.decode(encoded));
     }
 }

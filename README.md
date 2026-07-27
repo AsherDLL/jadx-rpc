@@ -69,9 +69,18 @@ jadx needs a 64 bit Java 11 or later. The zip ships both `jadx` and `jadx-gui`.
 jadx-rpc only uses `jadx`, the GUI is there when you want to look at the same
 target yourself.
 
-    jadx --version    # expect 1.5.6 or newer
+    jadx --version    # 1.5.1 or newer
 
 If `jadx` is not on PATH, point `JADX_BIN` at the launcher.
+
+| Feature | Minimum jadx |
+|---|---|
+| everything except the call graph | 1.5.1 |
+| `callers`, `callees` | 1.5.6 |
+
+The version is detected at `open` and reported by `status`. On an older jadx,
+`callers` and `callees` fail naming the version they need and nothing else is
+affected.
 
 ### jadx-rpc
 
@@ -105,6 +114,15 @@ for it, the commands below work immediately.
                             "components": [...], "exported_count": 10, ...}}
 
     $ jadx-rpc symbols 'crypt|token|secret'
+    {"ok": true, "result": {"scope": "app", "app_package_prefix": "org.fdroid",
+                            "matched": 0, "matched_all_scopes": 2030,
+                            "hidden_by_scope": 2030, ...}}
+
+That result is the reason scoping exists. All 2030 hits were in bundled
+libraries and none in the application's own code, so unscoped the honest answer
+"this app does not do that itself" is buried under 2030 that say otherwise.
+`--scope all` widens, and nothing is ever hidden without being counted.
+
     $ jadx-rpc members org.fdroid.fdroid.FDroidApp
     $ jadx-rpc class org.fdroid.fdroid.FDroidApp --lines 1:80
 
@@ -123,7 +141,8 @@ Renaming obfuscated symbols, recorded now and applied in one pass later:
 
 `AGENTS.md` has the full command reference, the cost of each command and a
 triage order that works. It is written to be read by a model, so point your
-agent at it.
+agent at it. `docs/INTEGRATION.md` is the engineer-facing version: what the
+engine requires, what it guarantees, and how to map it onto a tool table.
 
 ## Wiring it to an LLM
 
@@ -199,9 +218,14 @@ and none named, commands fail and list the candidates rather than guessing.
 
 ## Limits worth knowing
 
-- The index pass writes and then deletes a set of intermediate files roughly the
-  size of the decompiled application. Opening a very large APK needs transient
-  disk to match.
+- `open` needs scratch space of roughly 25 times the input size, transiently. The
+  index pass writes one JSON file per class beside the index it keeps, and jadx
+  has no flag to suppress them. It refuses to start rather than fill the disk,
+  and `--index-tmp DIR` points the scratch at a larger volume.
+- Scoping uses the manifest package cut to two segments, so `com.acme.app` scopes
+  to `com.acme` and catches sibling packages the same vendor owns. An app that
+  ships its own code under an unrelated top-level package will see it counted as
+  library code; `--scope all` is the escape, and `hidden_by_scope` is the signal.
 - Field renames need a JVM descriptor, which the index does not carry. Build it
   from the declaration in the decompiled source. Class and method renames need
   nothing extra, `members` prints the exact string to pass back.

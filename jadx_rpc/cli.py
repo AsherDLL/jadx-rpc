@@ -11,6 +11,16 @@ from . import core
 from .core import JadxRpcError
 
 
+def _add_scope(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--scope",
+        choices=["app", "all"],
+        default="app",
+        help="app restricts to the application's own package, the default, since most "
+             "classes in an APK are bundled libraries. Results always report what was hidden.",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="jadx-rpc",
@@ -26,6 +36,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--deobf", action="store_true", help="let jadx generate names for obfuscated symbols")
     p.add_argument("--threads", type=int, help="jadx worker threads")
     p.add_argument("--force", action="store_true", help="rebuild even if the session is current")
+    p.add_argument(
+        "--index-tmp",
+        metavar="DIR",
+        help="scratch directory for the index pass, which transiently needs roughly "
+             "25x the input size. Defaults to inside the session directory.",
+    )
 
     sub.add_parser("status", help="session state, counts and export progress")
     sub.add_parser("list", help="every open session")
@@ -38,6 +54,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("classes", help="list classes from the index")
     p.add_argument("pattern", nargs="?", help="case insensitive regex over class names")
+    _add_scope(p)
     p.add_argument("--limit", type=int, default=200)
 
     p = sub.add_parser("members", help="methods and fields of a class, with rename targets")
@@ -50,15 +67,18 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("symbols", help="search class, method and field names, no export needed")
     p.add_argument("pattern")
     p.add_argument("--kind", choices=["class", "method", "field"])
+    _add_scope(p)
     p.add_argument("--limit", type=int, default=100)
 
     p = sub.add_parser("search", help="regex over every decompiled source file")
     p.add_argument("pattern")
+    _add_scope(p)
     p.add_argument("--limit", type=int, default=100)
     p.add_argument("--context", type=int, default=0, help="lines of context around each hit")
 
     p = sub.add_parser("strings", help="string literals in the decompiled sources")
     p.add_argument("pattern", nargs="?")
+    _add_scope(p)
     p.add_argument("--min-len", type=int, default=4)
     p.add_argument("--limit", type=int, default=200)
 
@@ -100,7 +120,8 @@ def dispatch(args: argparse.Namespace) -> dict:
 
     if command == "open":
         return core.open_target(
-            args.input, deobf=args.deobf, threads=args.threads, export=args.export, force=args.force
+            args.input, deobf=args.deobf, threads=args.threads, export=args.export,
+            force=args.force, index_tmp=args.index_tmp,
         )
     if command == "status":
         return core.status(target)
@@ -111,17 +132,23 @@ def dispatch(args: argparse.Namespace) -> dict:
     if command == "close":
         return core.close(target, purge=args.purge)
     if command == "classes":
-        return core.classes(args.pattern, limit=args.limit, target=target)
+        return core.classes(args.pattern, scope=args.scope, limit=args.limit, target=target)
     if command == "members":
         return core.members(args.fqn, target)
     if command == "class":
         return core.decompile_class(args.fqn, lines=args.lines, target=target)
     if command == "symbols":
-        return core.symbols(args.pattern, kind=args.kind, limit=args.limit, target=target)
+        return core.symbols(
+            args.pattern, kind=args.kind, scope=args.scope, limit=args.limit, target=target
+        )
     if command == "search":
-        return core.search(args.pattern, limit=args.limit, context=args.context, target=target)
+        return core.search(
+            args.pattern, scope=args.scope, limit=args.limit, context=args.context, target=target
+        )
     if command == "strings":
-        return core.strings(args.pattern, min_len=args.min_len, limit=args.limit, target=target)
+        return core.strings(
+            args.pattern, scope=args.scope, min_len=args.min_len, limit=args.limit, target=target
+        )
     if command == "manifest":
         return core.manifest(target)
     if command == "entrypoints":

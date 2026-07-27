@@ -55,6 +55,25 @@ def opened(state, fixture_jar):
     return fixture_jar
 
 
+def plant_manifest(package: str = "com.example.app") -> None:
+    """Drop a manifest into the open session so package scoping has something to read.
+
+    A jar carries no AndroidManifest.xml, and building a real APK would need the
+    Android SDK. Scoping only ever reads the package attribute, so writing the
+    file the resource pass would have produced exercises the real code path.
+    """
+    import jadx_rpc
+    from jadx_rpc import core
+
+    session = core.resolve(None)
+    session.res.mkdir(parents=True, exist_ok=True)
+    (session.res / "AndroidManifest.xml").write_text(
+        f'<?xml version="1.0" encoding="utf-8"?>\n<manifest package="{package}"/>\n',
+        encoding="utf-8",
+    )
+    assert jadx_rpc.classes(limit=1)["scope"] == "app", "scoping did not pick the manifest up"
+
+
 def run_cli(*args: str) -> tuple[int, dict]:
     """Drive the real entry point in a subprocess, the way an agent would."""
     proc = subprocess.run(

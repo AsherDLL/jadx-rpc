@@ -30,9 +30,19 @@ from pathlib import Path
 
 from . import mappings
 
-# jadx returns 3 when some classes failed to decompile. The rest of the output
-# is still written and still usable, so it is a success for our purposes.
-JADX_OK = (0, 3)
+# Exit codes that do not mean the pass failed. A partial decompile, where some
+# classes could not be reconstructed, is normal on real applications and the rest
+# of the output is still written and still usable. jadx signals it with 1 up to
+# 1.5.1 and with 3 from 1.5.6 (JadxCLI.java, "finished with errors"), so both are
+# accepted and every pass verifies the artifact it was supposed to produce.
+JADX_OK = (0, 1, 3)
+
+# --call-graph, and therefore callers and callees, needs the jadx-analysis module.
+CALLGRAPH_MIN_VERSION = (1, 5, 6)
+
+# Scratch space the index pass needs, as a multiple of the input size. Measured
+# at 285 MB of transient per-class JSON for a 12 MB APK.
+INDEX_DISK_RATIO = 25
 
 ANDROID_NS = "{http://schemas.android.com/apk/res/android}"
 COMPONENT_TAGS = ("activity", "activity-alias", "service", "receiver", "provider")
@@ -182,17 +192,54 @@ def resolve(target: str | None = None) -> Session:
 # --------------------------------------------------------------------------
 
 
-def _run(session: Session, name: str, args: list[str]) -> int:
+def _run(session: Session, name: str, args: list[str], *, produces: Path | None = None) -> int:
+    """Run one jadx pass. `produces` is the artifact that proves it worked.
+
+    The exit code alone cannot decide this, because jadx changed what it returns
+    for a partial decompile: 1 up to 1.5.1, 3 from 1.5.6. Accepting both means
+    also accepting the code a genuine argument error returns, so every caller
+    names the file or directory the pass must leave behind.
+    """
     session.logs.mkdir(parents=True, exist_ok=True)
     log = session.logs / f"{name}.log"
     with log.open("w", encoding="utf-8") as handle:
         handle.write(" ".join(args) + "\n\n")
         handle.flush()
         rc = subprocess.call(args, stdout=handle, stderr=subprocess.STDOUT)
-    if rc not in JADX_OK:
+    missing = produces is not None and not produces.exists()
+    if rc not in JADX_OK or missing:
         tail = "\n".join(log.read_text(encoding="utf-8", errors="replace").splitlines()[-15:])
-        raise JadxRpcError(f"jadx {name} pass failed with exit {rc}\n{tail}")
+        why = f"produced no {produces.name}" if missing else f"exited {rc}"
+        raise JadxRpcError(f"jadx {name} pass failed, {why}\n{tail}")
     return rc
+
+
+def jadx_version(binary: str | None = None) -> str:
+    """The installed jadx version, or 'unknown' if it cannot be read."""
+    try:
+        done = subprocess.run(
+            [binary or jadx_bin(), "--version"],
+            capture_output=True, text=True, timeout=120, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+    return done.stdout.strip().splitlines()[0] if done.stdout.strip() else "unknown"
+
+
+def _version_tuple(text: str) -> tuple[int, ...] | None:
+    found = re.match(r"(\d+)\.(\d+)\.(\d+)", text or "")
+    return tuple(int(part) for part in found.groups()) if found else None
+
+
+def _supports_callgraph(meta: dict) -> bool:
+    """--call-graph landed in 1.5.6; the jadx-analysis module does not exist before it.
+
+    Unknown counts as unsupported. Passing an unrecognised flag makes jadx reject
+    its arguments and do nothing, which would cost the whole export rather than
+    just the call graph.
+    """
+    parsed = _version_tuple(meta.get("jadx_version", ""))
+    return parsed is not None and parsed >= CALLGRAPH_MIN_VERSION
 
 
 def _common_args(session: Session, meta: dict) -> list[str]:
@@ -206,16 +253,44 @@ def _common_args(session: Session, meta: dict) -> list[str]:
     return args
 
 
+def _index_tmp(session: Session, meta: dict) -> Path:
+    override = meta.get("index_tmp")
+    if override:
+        return Path(override).expanduser() / f"jadx-rpc-index-{session.dir.name}"
+    return session.dir / "_index"
+
+
+def _check_index_space(target: Path, sample_bytes: int) -> None:
+    """Refuse to start the index pass when the disk cannot hold its scratch files.
+
+    jadx writes one JSON file per class next to the mapping.json we keep, and
+    there is no flag to suppress them. Measured at 285 MB for a 12 MB APK, so the
+    ratio below is a heuristic from one real sample, not a guarantee. Failing here
+    with the numbers is recoverable; filling the filesystem is not.
+    """
+    target.mkdir(parents=True, exist_ok=True)
+    need = sample_bytes * INDEX_DISK_RATIO
+    free = shutil.disk_usage(target).free
+    if free < need:
+        raise JadxRpcError(
+            f"not enough space for the index pass on {target}: needs about "
+            f"{need / 1e9:.1f} GB (roughly {INDEX_DISK_RATIO}x the sample), "
+            f"{free / 1e9:.1f} GB free. Free space, or point --index-tmp at a "
+            "larger volume. The estimate is a heuristic, not a hard requirement."
+        )
+
+
 def _index_pass(session: Session, meta: dict) -> None:
     """Build mapping.json: every class, method and field, raw name and alias.
 
     Fallback decompilation mode skips code restructuring, which is what makes
     this pass seconds rather than minutes. The per class JSON files it writes
     alongside are not useful here and are deleted, so the pass costs transient
-    disk roughly the size of the decompiled application.
+    disk roughly the size of the decompiled application. See _check_index_space.
     """
-    tmp = session.dir / "_index"
+    tmp = _index_tmp(session, meta)
     shutil.rmtree(tmp, ignore_errors=True)
+    _check_index_space(tmp.parent, Path(meta["input"]).stat().st_size)
     args = [
         jadx_bin(), "-q",
         "--output-format", "json",
@@ -226,11 +301,8 @@ def _index_pass(session: Session, meta: dict) -> None:
         meta["input"],
     ]
     try:
-        _run(session, "index", args)
-        produced = tmp / "mapping.json"
-        if not produced.is_file():
-            raise JadxRpcError("jadx index pass produced no mapping.json")
-        shutil.move(str(produced), str(session.index_path))
+        _run(session, "index", args, produces=tmp / "mapping.json")
+        shutil.move(str(tmp / "mapping.json"), str(session.index_path))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     _apply_renames_to_index(session)
@@ -289,7 +361,7 @@ def _resource_pass(session: Session, meta: dict) -> None:
         meta["input"],
     ]
     try:
-        _run(session, "resources", args)
+        _run(session, "resources", args, produces=session.res)
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
 
@@ -300,12 +372,12 @@ def _export_pass(session: Session, meta: dict) -> None:
     args = [
         jadx_bin(), "-q",
         "--no-res",
-        "--call-graph", "json",
+        *(["--call-graph", "json"] if _supports_callgraph(meta) else []),
         "-d", str(session.dir), "-ds", str(session.src),
         *_common_args(session, meta),
         meta["input"],
     ]
-    _run(session, "export", args)
+    _run(session, "export", args, produces=session.src)
 
 
 # --------------------------------------------------------------------------
@@ -330,6 +402,7 @@ def open_target(
     threads: int | None = None,
     export: bool = False,
     force: bool = False,
+    index_tmp: str | None = None,
 ) -> dict:
     """Open a target and build its index. Reopening an unchanged target is free."""
     source = Path(input_path).expanduser().resolve()
@@ -357,6 +430,10 @@ def open_target(
         "threads": threads,
         "opened_at": int(time.time()),
         "renames_applied": 0,
+        "index_tmp": index_tmp,
+        # Read once and recorded, so later passes decide on flags without
+        # shelling out again and status can report what produced this session.
+        "jadx_version": jadx_version(),
     }
     session.write_meta(meta)
 
@@ -367,6 +444,7 @@ def open_target(
 
     result = {"id": session.dir.name, "input": str(source), "reused": False, "elapsed_s": elapsed}
     result.update(_index_counts(session))
+    result["jadx_version"] = meta["jadx_version"]
     result["export"] = "none"
     if export:
         result["export"] = start_export(session.dir.name)["state"]
@@ -445,6 +523,8 @@ def status(target: str | None = None) -> dict:
         "input": meta["input"],
         "input_present": source.is_file(),
         "deobf": meta.get("deobf", False),
+        "jadx_version": meta.get("jadx_version", "unknown"),
+        "callgraph_supported": _supports_callgraph(meta),
         "export": _export_state(session),
         "pending_renames": session.pending_renames(),
         "state_dir": str(session.dir),
@@ -505,17 +585,86 @@ def _tag(session: Session, payload: dict) -> dict:
     return payload
 
 
-def classes(pattern: str | None = None, *, limit: int = 200, target: str | None = None) -> dict:
+def _app_prefix(session: Session) -> str | None:
+    """The vendor package prefix marking the application's own code.
+
+    Taken from the manifest package cut to two segments, because an app's own
+    code routinely spans siblings of the manifest package (com.acme.app next to
+    com.acme.shared) while bundled libraries never share the vendor prefix.
+
+    Returns None when there is no manifest to read, which is every JAR and bare
+    DEX. Parsing costs about a millisecond, so it is done per call rather than
+    cached into a session file that older sessions would not have.
+    """
+    path = session.res / "AndroidManifest.xml"
+    if not path.is_file():
+        return None
+    try:
+        package = ET.parse(path).getroot().get("package", "")
+    except ET.ParseError:
+        return None
+    if not package:
+        return None
+    parts = package.split(".")
+    return ".".join(parts[:2]) if len(parts) > 2 else package
+
+
+def _resolve_scope(session: Session, scope: str) -> tuple[str | None, dict]:
+    """Return the package prefix to filter on, and fields describing the result.
+
+    A None prefix means everything is in scope. The returned fields always state
+    the scope actually applied, which is not always the one that was asked for.
+    """
+    if scope == "all":
+        return None, {"scope": "all"}
+    if scope != "app":
+        raise JadxRpcError(f"unknown scope {scope!r}, expected 'app' or 'all'")
+    prefix = _app_prefix(session)
+    if prefix is None:
+        return None, {
+            "scope": "all",
+            "scope_note": "no AndroidManifest.xml to scope against, searched everything",
+        }
+    return prefix, {"scope": "app", "app_package_prefix": prefix}
+
+
+def _in_scope(prefix: str | None, *names: str) -> bool:
+    # The trailing dot matters: org.fdroidx must not match the org.fdroid prefix.
+    if prefix is None:
+        return True
+    return any(name == prefix or name.startswith(prefix + ".") for name in names)
+
+
+def _note_scope_counts(result: dict, matched: int, matched_all: int) -> dict:
+    """Say what the scope excluded. Filtering silently would be the real bug."""
+    if matched_all != matched:
+        result["matched_all_scopes"] = matched_all
+        result["hidden_by_scope"] = matched_all - matched
+        result["scope_note"] = "library code hidden, pass --scope all to include it"
+    return result
+
+
+def classes(
+    pattern: str | None = None,
+    *,
+    scope: str = "app",
+    limit: int = 200,
+    target: str | None = None,
+) -> dict:
     """List classes from the index. Pattern is a case insensitive regex, no export needed."""
     session = resolve(target)
-    index = session.load_index()
+    prefix, scope_info = _resolve_scope(session, scope)
     matcher = re.compile(pattern, re.IGNORECASE) if pattern else None
-    out = []
-    total = 0
-    for entry in index["classes"]:
+    out: list[dict] = []
+    matched = 0
+    matched_all = 0
+    for entry in session.load_index()["classes"]:
         if matcher and not (matcher.search(entry["name"]) or matcher.search(entry["alias"])):
             continue
-        total += 1
+        matched_all += 1
+        if not _in_scope(prefix, entry["name"], entry["alias"]):
+            continue
+        matched += 1
         if len(out) < limit:
             item = {
                 "name": entry["alias"],
@@ -527,7 +676,11 @@ def classes(pattern: str | None = None, *, limit: int = 200, target: str | None 
             if entry.get("top-class"):
                 item["top_class"] = entry["top-class"]
             out.append(item)
-    return _tag(session, {"classes": out, "returned": len(out), "matched": total, "truncated": total > len(out)})
+    result = {
+        "classes": out, "returned": len(out), "matched": matched,
+        "truncated": matched > len(out), **scope_info,
+    }
+    return _tag(session, _note_scope_counts(result, matched, matched_all))
 
 
 def _normalize_symbol(symbol: str) -> str:
@@ -582,40 +735,62 @@ def members(fqn: str, target: str | None = None) -> dict:
     })
 
 
-def symbols(pattern: str, *, kind: str | None = None, limit: int = 100, target: str | None = None) -> dict:
+def symbols(
+    pattern: str,
+    *,
+    kind: str | None = None,
+    scope: str = "app",
+    limit: int = 100,
+    target: str | None = None,
+) -> dict:
     """Search class, method and field names in the index. No export needed."""
     session = resolve(target)
+    prefix, scope_info = _resolve_scope(session, scope)
     matcher = re.compile(pattern, re.IGNORECASE)
     kinds = {kind} if kind else {"class", "method", "field"}
     out: list[dict] = []
-    total = 0
+    matched = 0
+    matched_all = 0
+
     for entry in session.load_index()["classes"]:
+        # Members inherit their class's scope; a method is app code exactly when
+        # the class declaring it is.
+        in_scope = _in_scope(prefix, entry["name"], entry["alias"])
+        found: list[dict] = []
         if "class" in kinds and (matcher.search(entry["name"]) or matcher.search(entry["alias"])):
-            total += 1
-            if len(out) < limit:
-                out.append({"kind": "class", "name": entry["alias"], "raw_name": entry["name"]})
+            found.append({"kind": "class", "name": entry["alias"], "raw_name": entry["name"]})
         if "method" in kinds:
-            for m in entry.get("methods", ()):
-                if matcher.search(m["name"]) or matcher.search(m["alias"]):
-                    total += 1
-                    if len(out) < limit:
-                        out.append({
-                            "kind": "method",
-                            "name": f"{entry['alias']}.{m['alias']}",
-                            "raw_name": f"{entry['name']}.{m['name']}",
-                            "signature": m["signature"],
-                        })
+            found += [
+                {
+                    "kind": "method",
+                    "name": f"{entry['alias']}.{m['alias']}",
+                    "raw_name": f"{entry['name']}.{m['name']}",
+                    "signature": m["signature"],
+                }
+                for m in entry.get("methods", ())
+                if matcher.search(m["name"]) or matcher.search(m["alias"])
+            ]
         if "field" in kinds:
-            for f in entry.get("fields", ()):
-                if matcher.search(f["name"]) or matcher.search(f["alias"]):
-                    total += 1
-                    if len(out) < limit:
-                        out.append({
-                            "kind": "field",
-                            "name": f"{entry['alias']}.{f['alias']}",
-                            "raw_name": f"{entry['name']}.{f['name']}",
-                        })
-    return _tag(session, {"symbols": out, "returned": len(out), "matched": total, "truncated": total > len(out)})
+            found += [
+                {
+                    "kind": "field",
+                    "name": f"{entry['alias']}.{f['alias']}",
+                    "raw_name": f"{entry['name']}.{f['name']}",
+                }
+                for f in entry.get("fields", ())
+                if matcher.search(f["name"]) or matcher.search(f["alias"])
+            ]
+        matched_all += len(found)
+        if not in_scope:
+            continue
+        matched += len(found)
+        out.extend(found[: max(0, limit - len(out))])
+
+    result = {
+        "symbols": out, "returned": len(out), "matched": matched,
+        "truncated": matched > len(out), **scope_info,
+    }
+    return _tag(session, _note_scope_counts(result, matched, matched_all))
 
 
 # --------------------------------------------------------------------------
@@ -722,65 +897,93 @@ def _walk_sources(session: Session):
             continue  # an export writing underneath us
 
 
-def search(pattern: str, *, limit: int = 100, context: int = 0, target: str | None = None) -> dict:
+def _scope_root(prefix: str | None) -> str | None:
+    """The source-tree path prefix for a package prefix, or None for everything."""
+    return None if prefix is None else prefix.replace(".", "/") + "/"
+
+
+def search(
+    pattern: str,
+    *,
+    scope: str = "app",
+    limit: int = 100,
+    context: int = 0,
+    target: str | None = None,
+) -> dict:
     """Regex over every decompiled source file."""
     session = resolve(target)
     partial = _require_export(session, "search")
+    prefix, scope_info = _resolve_scope(session, scope)
+    root = _scope_root(prefix)
     matcher = re.compile(pattern)
     hits: list[dict] = []
-    total = 0
+    matched = 0
+    matched_all = 0
     files = 0
     for path, text in _walk_sources(session):
         if not matcher.search(text):
             continue
-        files += 1
         lines = text.splitlines()
-        for number, line in enumerate(lines, 1):
-            if not matcher.search(line):
-                continue
-            total += 1
-            if len(hits) < limit:
-                hit = {
-                    "file": str(path.relative_to(session.src)),
-                    "line": number,
-                    "text": line.strip()[:400],
-                }
-                if context:
-                    lo = max(0, number - 1 - context)
-                    hi = min(len(lines), number + context)
-                    hit["context"] = "\n".join(lines[lo:hi])
-                hits.append(hit)
-    return _tag(session, {
-        "hits": hits, "returned": len(hits), "matched": total,
-        "files_matched": files, "truncated": total > len(hits),
-        "partial": partial,
-    })
+        numbered = [(n, line) for n, line in enumerate(lines, 1) if matcher.search(line)]
+        matched_all += len(numbered)
+        relative = str(path.relative_to(session.src))
+        if root is not None and not relative.startswith(root):
+            continue
+        matched += len(numbered)
+        files += 1
+        for number, line in numbered:
+            if len(hits) >= limit:
+                break
+            hit = {"file": relative, "line": number, "text": line.strip()[:400]}
+            if context:
+                lo = max(0, number - 1 - context)
+                hi = min(len(lines), number + context)
+                hit["context"] = "\n".join(lines[lo:hi])
+            hits.append(hit)
+    result = {
+        "hits": hits, "returned": len(hits), "matched": matched,
+        "files_matched": files, "truncated": matched > len(hits),
+        "partial": partial, **scope_info,
+    }
+    return _tag(session, _note_scope_counts(result, matched, matched_all))
 
 
-def strings(pattern: str | None = None, *, min_len: int = 4, limit: int = 200, target: str | None = None) -> dict:
+def strings(
+    pattern: str | None = None,
+    *,
+    scope: str = "app",
+    min_len: int = 4,
+    limit: int = 200,
+    target: str | None = None,
+) -> dict:
     """String literals in the decompiled sources."""
     session = resolve(target)
     partial = _require_export(session, "strings")
+    prefix, scope_info = _resolve_scope(session, scope)
+    root = _scope_root(prefix)
     matcher = re.compile(pattern) if pattern else None
     seen: dict[str, dict] = {}
-    total = 0
+    occurrences = 0
+    occurrences_all = 0
     for path, text in _walk_sources(session):
+        relative = str(path.relative_to(session.src))
+        in_scope = root is None or relative.startswith(root)
         for number, line in enumerate(text.splitlines(), 1):
             for literal in STRING_LITERAL.findall(line):
                 if len(literal) < min_len or (matcher and not matcher.search(literal)):
                     continue
-                total += 1
+                occurrences_all += 1
+                if not in_scope:
+                    continue
+                occurrences += 1
                 if literal not in seen and len(seen) < limit:
-                    seen[literal] = {
-                        "value": literal,
-                        "file": str(path.relative_to(session.src)),
-                        "line": number,
-                    }
-    return _tag(session, {
+                    seen[literal] = {"value": literal, "file": relative, "line": number}
+    result = {
         "strings": list(seen.values()), "returned": len(seen),
-        "occurrences": total, "truncated": total > len(seen),
-        "partial": partial,
-    })
+        "occurrences": occurrences, "truncated": occurrences > len(seen),
+        "partial": partial, **scope_info,
+    }
+    return _tag(session, _note_scope_counts(result, occurrences, occurrences_all))
 
 
 # --------------------------------------------------------------------------
@@ -904,6 +1107,14 @@ def resource(path: str, target: str | None = None) -> dict:
 
 def _callgraph(session: Session) -> tuple[dict, list]:
     if not session.callgraph_path.is_file():
+        meta = session.read_meta()
+        if not _supports_callgraph(meta):
+            found = meta.get("jadx_version", "unknown")
+            wanted = ".".join(str(part) for part in CALLGRAPH_MIN_VERSION)
+            raise JadxRpcError(
+                f"callers and callees need jadx {wanted} or newer, this session was built "
+                f"with {found}. Every other command works on older jadx."
+            )
         _require_export(session, "the call graph")
         raise JadxRpcError("call graph missing, rerun: jadx-rpc export")
     data = json.loads(session.callgraph_path.read_text(encoding="utf-8"))
