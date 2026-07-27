@@ -876,13 +876,29 @@ def decompile_class(fqn: str, *, lines: str | None = None, target: str | None = 
     return _tag(session, result)
 
 
-def _require_export(session: Session, what: str) -> bool:
-    """Return True when the export is only partially written."""
+def _require_export(session: Session, what: str) -> None:
+    """Refuse unless the export finished, and say which of the reasons applies.
+
+    A half-written export is worse than no export. Searching one reports a count
+    that looks like an answer but is really a floor, and combined with scoping it
+    can report zero app-code hits purely because those files are not decompiled
+    yet. A caller acting on that concludes the application does not do something
+    it does. So the answer is only served when the export is complete.
+    """
     state = _export_state(session).get("state", "none")
-    if session.src.is_dir():
-        return state == "running"
+    if state == "ready" and session.src.is_dir():
+        return
     if state == "running":
-        raise JadxRpcError(f"{what} needs the full export, which is still running. Check: jadx-rpc status")
+        raise JadxRpcError(
+            f"{what} needs the full export, which is still running. Poll: jadx-rpc status. "
+            "Partial results are withheld deliberately: a count taken mid-export reads like "
+            "an answer but is only a floor."
+        )
+    if state == "failed":
+        raise JadxRpcError(
+            f"{what} needs the full export, which failed. See logs/export.log in the session "
+            "directory, then rerun: jadx-rpc export"
+        )
     raise JadxRpcError(
         f"{what} needs every class decompiled. Start it with: jadx-rpc export --background "
         "(minutes on a real app). For name lookups that need no export use: jadx-rpc symbols"
@@ -912,7 +928,7 @@ def search(
 ) -> dict:
     """Regex over every decompiled source file."""
     session = resolve(target)
-    partial = _require_export(session, "search")
+    _require_export(session, "search")
     prefix, scope_info = _resolve_scope(session, scope)
     root = _scope_root(prefix)
     matcher = re.compile(pattern)
@@ -943,7 +959,7 @@ def search(
     result = {
         "hits": hits, "returned": len(hits), "matched": matched,
         "files_matched": files, "truncated": matched > len(hits),
-        "partial": partial, **scope_info,
+        **scope_info,
     }
     return _tag(session, _note_scope_counts(result, matched, matched_all))
 
@@ -958,7 +974,7 @@ def strings(
 ) -> dict:
     """String literals in the decompiled sources."""
     session = resolve(target)
-    partial = _require_export(session, "strings")
+    _require_export(session, "strings")
     prefix, scope_info = _resolve_scope(session, scope)
     root = _scope_root(prefix)
     matcher = re.compile(pattern) if pattern else None
@@ -981,7 +997,7 @@ def strings(
     result = {
         "strings": list(seen.values()), "returned": len(seen),
         "occurrences": occurrences, "truncated": occurrences > len(seen),
-        "partial": partial, **scope_info,
+        **scope_info,
     }
     return _tag(session, _note_scope_counts(result, occurrences, occurrences_all))
 
@@ -1106,16 +1122,19 @@ def resource(path: str, target: str | None = None) -> dict:
 
 
 def _callgraph(session: Session) -> tuple[dict, list]:
+    meta = session.read_meta()
+    if not _supports_callgraph(meta):
+        found = meta.get("jadx_version", "unknown")
+        wanted = ".".join(str(part) for part in CALLGRAPH_MIN_VERSION)
+        raise JadxRpcError(
+            f"callers and callees need jadx {wanted} or newer, this session was built "
+            f"with {found}. Every other command works on older jadx."
+        )
+    # Checked before reading the file, not after. A re-export overwrites
+    # callgraph.json in place, so an existing one during a running export belongs
+    # to the previous run and would answer with edges that no longer hold.
+    _require_export(session, "the call graph")
     if not session.callgraph_path.is_file():
-        meta = session.read_meta()
-        if not _supports_callgraph(meta):
-            found = meta.get("jadx_version", "unknown")
-            wanted = ".".join(str(part) for part in CALLGRAPH_MIN_VERSION)
-            raise JadxRpcError(
-                f"callers and callees need jadx {wanted} or newer, this session was built "
-                f"with {found}. Every other command works on older jadx."
-            )
-        _require_export(session, "the call graph")
         raise JadxRpcError("call graph missing, rerun: jadx-rpc export")
     data = json.loads(session.callgraph_path.read_text(encoding="utf-8"))
     return {n["id"]: n["method"] for n in data["nodes"]}, data["edges"]

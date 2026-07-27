@@ -170,9 +170,12 @@ it from the declaration in the decompiled source.
 
 ## Things that will bite you
 
-- `search` and `strings` fail with a clear error until the export finishes. That
-  is not a bug in your command, it is the export not being ready. Check
-  `status`, or use `symbols` which needs no export.
+- `search`, `strings`, `callers` and `callees` fail with a clear error until the
+  export is finished, including while it is part way through. That is not a bug
+  in your command. A count taken mid-export looks like an answer but is only a
+  floor, and scoped it can read as zero app hits purely because those files are
+  not decompiled yet, so the result is withheld rather than shown with a caveat
+  you might miss. Poll `status`, or use `symbols`, which needs no export.
 - Inner classes live in their parent's source file. Asking for
   `com.foo.Outer.Inner` returns the source of `com.foo.Outer` with a note
   saying so.

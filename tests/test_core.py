@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
@@ -220,6 +221,42 @@ def test_callgraph_refuses_before_the_export(opened):
         jadx_rpc.callers(ENCODE)
 
 
+class TestHalfFinishedExport:
+    """A partial export must not answer. Found end to end on a real APK.
+
+    While the export was running, a scoped search reported matched: 0 for app
+    code alongside 724 library hits, purely because the app's own files were not
+    decompiled yet. That reads exactly like a clean negative finding.
+    """
+
+    @pytest.fixture(autouse=True)
+    def half_exported(self, opened):
+        jadx_rpc.start_export(background=False)
+        self.marker = core.resolve(None).dir / "export.json"
+
+    def _pretend(self, state: dict) -> None:
+        core._write_json(self.marker, state)
+
+    def test_a_running_export_withholds_search(self):
+        self._pretend({"state": "running", "pid": os.getpid(), "started_at": 0})
+        with pytest.raises(JadxRpcError, match="still running"):
+            jadx_rpc.search("hunter2")
+
+    def test_a_running_export_withholds_strings_and_callers(self):
+        self._pretend({"state": "running", "pid": os.getpid(), "started_at": 0})
+        for call in (jadx_rpc.strings, lambda: jadx_rpc.callers(ENCODE)):
+            with pytest.raises(JadxRpcError, match="still running"):
+                call()
+
+    def test_a_failed_export_withholds_search_and_says_where_to_look(self):
+        self._pretend({"state": "failed", "error": "boom"})
+        with pytest.raises(JadxRpcError, match=r"failed.*logs/export\.log"):
+            jadx_rpc.search("hunter2")
+
+    def test_a_ready_export_answers(self):
+        assert jadx_rpc.search("hunter2")["matched"] >= 1
+
+
 class TestAfterExport:
     @pytest.fixture(autouse=True)
     def exported(self, opened):
@@ -239,7 +276,6 @@ class TestAfterExport:
     def test_search_finds_source_text(self):
         result = jadx_rpc.search("hunter2", context=1)
         assert result["matched"] >= 1
-        assert result["partial"] is False
         hit = result["hits"][0]
         assert hit["file"].endswith("Crypto.java")
         assert "hunter2" in hit["context"]

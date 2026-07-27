@@ -42,8 +42,9 @@ context window.
 
 **Nothing hidden silently.** When `--scope app` filters library code, the result
 carries `matched_all_scopes` and `hidden_by_scope`. When renames are pending,
-reads carry `stale: true`. When the export is still running, results carry
-`partial: true`.
+reads carry `stale: true`. When a result would be incomplete for a reason the
+caller cannot see, such as a half-finished export, the command fails instead of
+answering.
 
 ## The call shape
 
@@ -99,9 +100,11 @@ index of every class, method and field. `export` decompiles everything and is th
 only expensive operation. It is opt-in (`open --export`, or `export` later) and
 runs in the background, so the cheap commands stay available while it works.
 
-Commands needing the export fail with a clear message until it finishes, rather
-than returning partial results as if they were complete. `symbols` answers name
-lookups without it.
+Commands needing the export fail with a clear message until it reports `ready`,
+and that includes while it is running or after it failed. A half-written export
+would answer with a count that reads like a total but is a floor, which under
+`--scope app` can look like a clean negative finding. Withholding is deliberate.
+`symbols` answers name lookups without any export.
 
 ## Scope
 
