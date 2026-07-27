@@ -702,7 +702,11 @@ def _find_class(index: dict, fqn: str) -> dict:
     for entry in index["classes"]:
         if entry["alias"] == wanted or entry["name"] == wanted:
             return entry
-    raise JadxRpcError(f"class not found: {fqn}. Try: jadx-rpc classes --filter {fqn.split('.')[-1]}")
+    short = fqn.split(".")[-1]
+    raise JadxRpcError(
+        f"class not found: {fqn}. Try: jadx-rpc classes {short} "
+        f"(add --scope all if it is library code)"
+    )
 
 
 def members(fqn: str, target: str | None = None) -> dict:
@@ -900,8 +904,9 @@ def _require_export(session: Session, what: str) -> None:
             "directory, then rerun: jadx-rpc export"
         )
     raise JadxRpcError(
-        f"{what} needs every class decompiled. Start it with: jadx-rpc export --background "
-        "(minutes on a real app). For name lookups that need no export use: jadx-rpc symbols"
+        f"{what} needs every class decompiled. Start it with: jadx-rpc export "
+        "(runs in the background, minutes on a real app). For name lookups that need "
+        "no export use: jadx-rpc symbols"
     )
 
 

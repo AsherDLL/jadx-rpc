@@ -167,8 +167,12 @@ def test_members_carries_usable_rename_targets(opened):
 
 
 def test_members_rejects_an_unknown_class(opened):
-    with pytest.raises(JadxRpcError, match="class not found"):
+    with pytest.raises(JadxRpcError, match="class not found") as caught:
         jadx_rpc.members("com.example.app.Nope")
+    # The hint has to name a command that exists: classes takes a positional
+    # pattern, there is no --filter flag.
+    assert "jadx-rpc classes Nope" in str(caught.value)
+    assert "--filter" not in str(caught.value)
 
 
 def test_class_decompiles_on_demand_then_caches(opened):
@@ -437,6 +441,46 @@ class TestCli:
         assert code == 1
         assert payload["ok"] is False
         assert "error" in payload
+
+    def test_every_command_suggested_in_an_error_actually_exists(self, state):
+        """Error messages tell the caller what to run next. Those have to be real.
+
+        Two shipped hints named things that do not exist: `classes --filter`,
+        where the pattern is positional, and `export --background`, where the
+        flag is `--wait` and backgrounding is the default.
+        """
+        source = (REPO / "jadx_rpc" / "core.py").read_text()
+
+        commands = set(re.findall(r"jadx-rpc ([a-z-]+)", source))
+        assert commands, "no suggestions found, the regex stopped matching"
+        top = subprocess.run(
+            [sys.executable, "-m", "jadx_rpc.cli", "--help"],
+            capture_output=True, text=True, cwd=REPO,
+        ).stdout
+        for command in sorted(commands):
+            assert re.search(rf"^\s+{re.escape(command)}\s", top, re.M), (
+                f"error messages suggest `jadx-rpc {command}`, which is not a command"
+            )
+
+        # Only lines that mention jadx-rpc, so the flags this module passes
+        # through to jadx itself (--no-res, --call-graph) and the internal
+        # worker flag are not mistaken for advice to the caller. Flags are
+        # matched against the whole CLI rather than one subcommand, because a
+        # suggestion often puts a placeholder between the command and its flag.
+        every_help = top + "".join(
+            subprocess.run(
+                [sys.executable, "-m", "jadx_rpc.cli", command, "--help"],
+                capture_output=True, text=True, cwd=REPO,
+            ).stdout
+            for command in sorted(commands)
+        )
+        advised = {
+            flag
+            for line in source.splitlines() if "jadx-rpc " in line
+            for flag in re.findall(r"(?<![\w-])(--[a-z][a-z-]+)", line)
+        }
+        for flag in sorted(advised):
+            assert flag in every_help, f"error messages suggest {flag}, which no command accepts"
 
     def test_mcp_tool_list_needs_no_optional_extra(self, state):
         code, payload = run_cli("mcp", "--list-tools")
